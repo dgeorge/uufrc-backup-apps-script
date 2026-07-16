@@ -69,7 +69,7 @@ function updateBackup() {
         console.log('Approaching time limit — stopping early. Remaining files will be copied on the next run.');
         break;
       }
-      syncFolder(folder.id, folder.name, backupFolderId, backedUpInRoot, records, startTime);
+      syncFolder(folder.id, folder.name, escapePathSegment(folder.name), backupFolderId, backedUpInRoot, records, startTime);
     }
 
     if (records.length > 0) {
@@ -192,6 +192,28 @@ function fetchBackedUpMap(parentFolderId) {
 }
 
 /**
+ * Escapes '/' and '\' in a single folder name so it can be embedded as one
+ * segment of a '/'-joined display path (see syncFolder's folderPath param)
+ * without being confused with the segment separator itself. Folder names on
+ * Drive may legally contain '/', so the raw name can't be joined as-is.
+ *
+ * Backslashes must be escaped first — otherwise the backslash introduced by
+ * escaping a '/' would itself get escaped again.
+ */
+function escapePathSegment(name) {
+  return name.replace(/\\/g, '\\\\').replace(/\//g, '\\/');
+}
+
+/**
+ * Inverse of escapePathSegment. Given one segment extracted from a
+ * folderPath (split on '/' not preceded by '\'), returns the original
+ * folder name. For anyone parsing the 'folder' column of backup.csv.
+ */
+function unescapePathSegment(segment) {
+  return segment.replace(/\\(.)/g, '$1');
+}
+
+/**
  * Finds a folder with the given name inside parentId, creating it if absent.
  * For the top-level backup folder, pass 'root' as parentId.
  */
@@ -218,21 +240,25 @@ function findOrCreateFolder(name, parentId) {
  * Recursively copies a shared folder and its descendants into backupParentId.
  *
  * @param {string} sourceFolderId    Drive ID of the shared source folder.
+ * @param {string} folderName        The source folder's own name (may itself
+ *                                   contain '/', since Drive allows it). Used
+ *                                   as-is when creating the backup folder.
  * @param {string} folderPath        Full path relative to the top-level shared
- *                                   root (e.g. "Finance" or "Finance/2024").
- *                                   Stored in backup.csv so every file carries
- *                                   its complete original path.
+ *                                   root (e.g. "Finance" or "Finance/2024"),
+ *                                   with each segment run through
+ *                                   escapePathSegment() before being joined
+ *                                   with '/'. Stored in backup.csv so every
+ *                                   file carries its complete original path.
+ *                                   A literal '/' inside a folder's own name
+ *                                   is escaped as '\/', so it can't be
+ *                                   confused with the segment separator.
  * @param {string} backupParentId    Drive ID of the destination parent folder.
  * @param {Map}    backedUpInParent  fetchBackedUpMap() result for backupParentId.
  * @param {Array}  records           Accumulator for CSV rows.
  * @param {number} startTime         Date.now() at the start of this run.
  */
-function syncFolder(sourceFolderId, folderPath, backupParentId, backedUpInParent, records, startTime) {
+function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, backedUpInParent, records, startTime) {
   if (isTimedOut(startTime)) return;
-
-  // The backup folder only needs the immediate name (last path component); the
-  // full hierarchy is expressed by its position inside the backup tree.
-  const folderName = folderPath.split('/').pop();
 
   // Re-use the backup folder if one was created on a prior run.
   let backupFolderId = backedUpInParent.get(sourceFolderId)?.id;
@@ -281,7 +307,7 @@ function syncFolder(sourceFolderId, folderPath, backupParentId, backedUpInParent
       console.log('Approaching time limit — stopping early. Remaining files will be copied on the next run.');
       break;
     }
-    syncFolder(subfolder.id, `${folderPath}/${subfolder.name}`, backupFolderId, backedUpInFolder, records, startTime);
+    syncFolder(subfolder.id, subfolder.name, `${folderPath}/${escapePathSegment(subfolder.name)}`, backupFolderId, backedUpInFolder, records, startTime);
   }
 }
 
@@ -353,6 +379,12 @@ function csvEscape(value) {
 /**
  * Appends new rows to backup.csv in the root of this account's Drive.
  * Creates the file with a header row if it doesn't exist yet.
+ *
+ * The 'folder' column is a '/'-joined path whose segments are pre-escaped by
+ * escapePathSegment() — a literal '/' within one folder's own name appears as
+ * '\/', so splitting the raw cell value on '/' not preceded by '\', then
+ * running each piece through unescapePathSegment(), recovers the original
+ * per-folder names unambiguously.
  */
 function appendToBackupCsv(records) {
   const columns = ['name', 'folder', 'owner', 'size', 'createdTime', 'modifiedTime', 'copiedTime'];
