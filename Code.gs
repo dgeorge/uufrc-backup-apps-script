@@ -20,7 +20,7 @@
 
 // Email address that receives a summary after each run (success or error).
 // Set to '' to disable email notifications.
-const NOTIFICATION_EMAIL = '';  // e.g. 'it.uufrc@gmail.com'
+const NOTIFICATION_EMAIL = 'it.uufrc@gmail.com';  // e.g. 'it.uufrc@gmail.com'
 
 // Maximum wall-clock milliseconds per run. Apps Script kills the process at
 // 6 minutes (360 000 ms); stopping at 5 minutes leaves a safety margin.
@@ -50,13 +50,13 @@ function updateBackup() {
 
   try {
     // Find or create the top-level "backup" folder in this account's Drive root.
-    const backupFolderId = findOrCreateFolder('backup', 'root');
+    const backupFolderId = findOrCreateFolder('backup', 'root', '/backup');
 
     // List every item shared with this account (excluding media, shortcuts, trash).
     const allShared = listSharedItems();
 
     // Build a map of what's already been backed up in the root backup folder.
-    const backedUpInRoot = fetchBackedUpMap(backupFolderId);
+    const backedUpInRoot = fetchBackedUpMap(backupFolderId, '/backup');
 
     // Copy loose files shared directly (not inside a shared folder).
     const sharedFiles = allShared.filter(f => f.mimeType !== 'application/vnd.google-apps.folder');
@@ -116,7 +116,7 @@ function isRetryableError(err) {
   const msg = String(err.message || err);
   if (/429|Too Many Requests/i.test(msg)) return true;
   if (/5\d\d|Internal Server Error|Service Unavailable/i.test(msg)) return true;
-  if (/rateLimitExceeded|userRateLimitExceeded/i.test(msg)) return true;
+  if (/rate limit exceeded|rateLimitExceeded|userRateLimitExceeded/i.test(msg)) return true;
   return false;
 }
 
@@ -128,7 +128,11 @@ function withRetry(operation, label) {
       return operation();
     } catch (err) {
       attempt++;
-      if (attempt > MAX_RETRIES || !isRetryableError(err)) throw err;
+      if (attempt > MAX_RETRIES || !isRetryableError(err)) {
+        const contextualError = new Error(`${label} failed: ${err.message || err}`);
+        if (err.stack) contextualError.stack += `\nCaused by:\n${err.stack}`;
+        throw contextualError;
+      }
       const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 1000);
       console.warn(`${label} failed; retry ${attempt}/${MAX_RETRIES} in ${delay}ms: ${err.message}`);
       Utilities.sleep(delay);
@@ -153,7 +157,7 @@ function listSharedItems() {
       pageSize: 100,
       orderBy: 'name',
       pageToken,
-    }), 'list shared files');
+    }), 'list shared files in "Shared with me"');
     for (const f of (res.files || [])) items.push(f);
     pageToken = res.nextPageToken;
   } while (pageToken);
@@ -167,7 +171,7 @@ function listSharedItems() {
  * The previous Electron-based app used the same property keys, so the first
  * Apps Script run recognises its copies and will not re-copy them.
  */
-function fetchBackedUpMap(parentFolderId) {
+function fetchBackedUpMap(parentFolderId, folderPath) {
   const map = new Map();
   let pageToken;
   do {
@@ -176,7 +180,7 @@ function fetchBackedUpMap(parentFolderId) {
       fields: 'nextPageToken, files(id, properties)',
       pageSize: 100,
       pageToken,
-    }), 'list backup folder contents');
+    }), `list backup folder contents "${folderPath}"`);
     for (const f of (res.files || [])) {
       const props = f.properties;
       if (props && props.uufrc_backup_original_id) {
@@ -216,20 +220,21 @@ function unescapePathSegment(segment) {
 /**
  * Finds a folder with the given name inside parentId, creating it if absent.
  * For the top-level backup folder, pass 'root' as parentId.
+ * folderPath is the full display path of the folder being found or created.
  */
-function findOrCreateFolder(name, parentId) {
+function findOrCreateFolder(name, parentId, folderPath) {
   const escapedName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
   const res = withRetry(() => Drive.Files.list({
     q: `name = '${escapedName}' and mimeType = 'application/vnd.google-apps.folder' and '${parentId}' in parents and trashed = false`,
     fields: 'files(id)',
     pageSize: 1,
-  }), `find folder "${name}"`);
+  }), `find folder "${folderPath}"`);
   if (res.files && res.files.length > 0) return res.files[0].id;
   const created = withRetry(() => Drive.Files.create(
     { name, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] },
     null,
     { fields: 'id' }
-  ), `create folder "${name}"`);
+  ), `create folder "${folderPath}"`);
   return created.id;
 }
 
@@ -272,12 +277,12 @@ function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, back
       },
       null,
       { fields: 'id' }
-    ), `create backup folder "${folderName}"`);
+    ), `create backup folder "/backup/${folderPath}"`);
     backupFolderId = created.id;
   }
 
   // Build a map of what's already been backed up inside this folder.
-  const backedUpInFolder = fetchBackedUpMap(backupFolderId);
+  const backedUpInFolder = fetchBackedUpMap(backupFolderId, `/backup/${folderPath}`);
 
   // List the source folder's children, excluding media/shortcuts/trash.
   const subfolders = [];
@@ -289,7 +294,7 @@ function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, back
       fields: 'nextPageToken, files(id, name, mimeType, version, owners, size, createdTime, modifiedTime)',
       pageSize: 100,
       pageToken,
-    }), 'list shared folder contents');
+    }), `list shared folder contents "${folderPath}"`);
     for (const f of (res.files || [])) {
       if (f.mimeType === 'application/vnd.google-apps.folder') {
         subfolders.push(f);
@@ -332,6 +337,8 @@ function copyFiles(files, backupParentId, backedUpIds, records, startTime) {
     const existing = backedUpIds.get(file.id);
     if (existing && existing.version === String(file.version)) continue;
 
+    const filePath = (file.folderPath ? `${file.folderPath}/` : '') + escapePathSegment(file.name);
+
     // Copy the new version first, then remove the stale backup (if any).
     withRetry(() => Drive.Files.copy(
       {
@@ -344,10 +351,10 @@ function copyFiles(files, backupParentId, backedUpIds, records, startTime) {
       },
       file.id,
       { fields: 'id' }
-    ), `copy "${file.name}"`);
+    ), `copy "${filePath}"`);
 
     if (existing) {
-      withRetry(() => Drive.Files.remove(existing.id), `delete old copy of "${file.name}"`);
+      withRetry(() => Drive.Files.remove(existing.id), `delete old copy "/backup/${filePath}"`);
     }
 
     const folder = file.folderPath || '';
@@ -394,26 +401,26 @@ function appendToBackupCsv(records) {
     q: "name = 'backup.csv' and 'root' in parents and trashed = false",
     fields: 'files(id)',
     pageSize: 1,
-  }), 'find backup.csv');
+  }), 'find "/backup.csv"');
 
   const existingFile = searchRes.files && searchRes.files[0];
   if (existingFile) {
     // Read the existing content, append new rows, and update in place.
     const existingContent = withRetry(
       () => DriveApp.getFileById(existingFile.id).getBlob().getDataAsString(),
-      'download backup.csv'
+      'download "/backup.csv"'
     );
     withRetry(() => Drive.Files.update(
       {},
       existingFile.id,
       Utilities.newBlob(existingContent + '\n' + newRows, 'text/plain')
-    ), 'update backup.csv');
+    ), 'update "/backup.csv"');
   } else {
     const headerRow = columns.join(',');
     withRetry(() => Drive.Files.create(
       { name: 'backup.csv' },
       Utilities.newBlob(headerRow + '\n' + newRows, 'text/plain'),
       { fields: 'id' }
-    ), 'create backup.csv');
+    ), 'create "/backup.csv"');
   }
 }
