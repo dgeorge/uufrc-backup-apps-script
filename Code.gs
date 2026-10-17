@@ -20,7 +20,7 @@
 
 // Email address that receives a summary after each run (success or error).
 // Set to '' to disable email notifications.
-const NOTIFICATION_EMAIL = 'it.uufrc@gmail.com';  // e.g. 'it.uufrc@gmail.com'
+const NOTIFICATION_EMAIL = ''; // 'it.uufrc@gmail.com';  // e.g. 'it.uufrc@gmail.com'
 
 // Maximum wall-clock milliseconds per run. Apps Script kills the process at
 // 6 minutes (360 000 ms); stopping at 5 minutes leaves a safety margin.
@@ -153,7 +153,7 @@ function listSharedItems() {
   do {
     const res = withRetry(() => Drive.Files.list({
       q: "sharedWithMe = true and mimeType != 'application/vnd.google-apps.shortcut' and not mimeType contains 'image/' and not mimeType contains 'video/' and not mimeType contains 'audio/' and trashed = false",
-      fields: 'nextPageToken, files(id, name, mimeType, version, owners, size, createdTime, modifiedTime)',
+      fields: 'nextPageToken, files(id, name, mimeType, version, owners, size, createdTime, modifiedTime, parents)',
       pageSize: 100,
       orderBy: 'name',
       pageToken,
@@ -161,7 +161,15 @@ function listSharedItems() {
     for (const f of (res.files || [])) items.push(f);
     pageToken = res.nextPageToken;
   } while (pageToken);
-  return items;
+
+  // Suppose the folder A contains folder B, folder B contains folder C, and both A and C
+  // are swhared with this user. We only want to backup the contents of folder C once, and
+  // we will enounter folder C with traversing folder A. Therefore, folder C should be removed
+  // from this shared-with-me list. Folder C will have a parents array because we have access
+  // to C's parents, but folder A will not. Therefore, the presence of a parents array is flag
+  // telling us that C is nested inside some other shared folder, so its children should not
+  // be traversed.
+  return items.filter(item => item.parents === undefined);
 }
 
 /**
@@ -359,7 +367,7 @@ function copyFiles(files, backupParentId, backedUpIds, records, startTime) {
 
     const folder = file.folderPath || '';
     const ownerName = (file.owners && file.owners.length === 1) ? file.owners[0].displayName : '';
-    console.log(`Copied "${file.name}"${folder ? ` from folder "${folder}"` : ''} (size: ${file.size || 'unknown'}, modified: ${file.modifiedTime || 'unknown'})`);
+    console.log(`Copied "${file.name}"${folder ? ` from folder "${folder}"` : ''} (size: ${file.size || 'unknown'}, modified: ${file.modifiedTime || 'unknown'}, version: ${file.version || 'unknown'})`);
     records.push({
       name: file.name,
       folder,
@@ -367,6 +375,7 @@ function copyFiles(files, backupParentId, backedUpIds, records, startTime) {
       size: file.size || '',
       createdTime: file.createdTime || '',
       modifiedTime: file.modifiedTime || '',
+      version: file.version || '',
       copiedTime: new Date().toISOString(),
     });
   }
@@ -394,7 +403,7 @@ function csvEscape(value) {
  * per-folder names unambiguously.
  */
 function appendToBackupCsv(records) {
-  const columns = ['name', 'folder', 'owner', 'size', 'createdTime', 'modifiedTime', 'copiedTime'];
+  const columns = ['name', 'folder', 'owner', 'size', 'createdTime', 'modifiedTime', 'copiedTime', 'version'];
   const newRows = records.map(r => columns.map(c => csvEscape(r[c])).join(',')).join('\n');
 
   const searchRes = withRetry(() => Drive.Files.list({
