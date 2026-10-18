@@ -20,7 +20,7 @@
 
 // Email address that receives a summary after each run (success or error).
 // Set to '' to disable email notifications.
-const NOTIFICATION_EMAIL = ''; // 'it.uufrc@gmail.com';  // e.g. 'it.uufrc@gmail.com'
+const NOTIFICATION_EMAIL = 'it.uufrc@gmail.com';  // e.g. 'it.uufrc@gmail.com'
 
 // Maximum wall-clock milliseconds per run. Apps Script kills the process at
 // 6 minutes (360 000 ms); stopping at 5 minutes leaves a safety margin.
@@ -50,17 +50,17 @@ function updateBackup() {
 
   try {
     // Find or create the top-level "backup" folder in this account's Drive root.
-    const backupFolderId = findOrCreateFolder('backup', 'root', '/backup');
+    const backupFolderId = findOrCreateBackupFolder();
 
     // List every item shared with this account (excluding media, shortcuts, trash).
     const allShared = listSharedItems();
 
-    // Build a map of what's already been backed up in the root backup folder.
-    const backedUpInRoot = fetchBackedUpMap(backupFolderId, '/backup');
+    // Build one backup map across folders, excluding items shared with this account.
+    const backupMap = fetchBackedUpMap();
 
     // Copy loose files shared directly (not inside a shared folder).
     const sharedFiles = allShared.filter(f => f.mimeType !== 'application/vnd.google-apps.folder');
-    copyFiles(sharedFiles, backupFolderId, backedUpInRoot, records, startTime);
+    copyFiles(sharedFiles, backupFolderId, backupMap, records, startTime);
 
     // Recursively sync each shared folder into a matching subfolder of backup.
     const sharedFolders = allShared.filter(f => f.mimeType === 'application/vnd.google-apps.folder');
@@ -69,7 +69,7 @@ function updateBackup() {
         console.log('Approaching time limit — stopping early. Remaining files will be copied on the next run.');
         break;
       }
-      syncFolder(folder.id, folder.name, escapePathSegment(folder.name), backupFolderId, backedUpInRoot, records, startTime);
+      syncFolder(folder.id, folder.name, escapePathSegment(folder.name), backupFolderId, backupMap, records, startTime);
     }
 
     if (records.length > 0) {
@@ -173,27 +173,26 @@ function listSharedItems() {
 }
 
 /**
- * Builds a map of { originalFileId → { id: backupFileId, version: string } }
- * by reading the custom `properties` stamped on every backed-up item.
- *
- * The previous Electron-based app used the same property keys, so the first
- * Apps Script run recognises its copies and will not re-copy them.
+ * Builds a map of { originalFileId → { id: backupFileId, parentId: parent of backupFileId, version: string } }
+ * by reading the custom `properties` stamped on backed-up items across all
+ * folders, excluding items shared with this account.
  */
-function fetchBackedUpMap(parentFolderId, folderPath) {
+function fetchBackedUpMap() {
   const map = new Map();
   let pageToken;
   do {
     const res = withRetry(() => Drive.Files.list({
-      q: `'${parentFolderId}' in parents and trashed = false`,
-      fields: 'nextPageToken, files(id, properties)',
-      pageSize: 100,
+      q: "trashed = false",
+      fields: 'nextPageToken, files(id, parents, properties)',
+      pageSize: 1000,
       pageToken,
-    }), `list backup folder contents "${folderPath}"`);
+    }), 'list files not shared with me for backup map');
     for (const f of (res.files || [])) {
       const props = f.properties;
       if (props && props.uufrc_backup_original_id) {
         map.set(props.uufrc_backup_original_id, {
           id: f.id,
+          parentId: f.parents && f.parents[0],
           version: props.uufrc_backup_original_version,
         });
       }
@@ -217,32 +216,20 @@ function escapePathSegment(name) {
 }
 
 /**
- * Inverse of escapePathSegment. Given one segment extracted from a
- * folderPath (split on '/' not preceded by '\'), returns the original
- * folder name. For anyone parsing the 'folder' column of backup.csv.
+ * Finds the "backup" folder in this account's Drive root, creating it if absent.
  */
-function unescapePathSegment(segment) {
-  return segment.replace(/\\(.)/g, '$1');
-}
-
-/**
- * Finds a folder with the given name inside parentId, creating it if absent.
- * For the top-level backup folder, pass 'root' as parentId.
- * folderPath is the full display path of the folder being found or created.
- */
-function findOrCreateFolder(name, parentId, folderPath) {
-  const escapedName = name.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+function findOrCreateBackupFolder() {
   const res = withRetry(() => Drive.Files.list({
-    q: `name = '${escapedName}' and mimeType = 'application/vnd.google-apps.folder' and '${parentId}' in parents and trashed = false`,
+    q: "name = 'backup' and mimeType = 'application/vnd.google-apps.folder' and 'root' in parents and trashed = false",
     fields: 'files(id)',
     pageSize: 1,
-  }), `find folder "${folderPath}"`);
+  }), 'find folder "/backup"');
   if (res.files && res.files.length > 0) return res.files[0].id;
   const created = withRetry(() => Drive.Files.create(
-    { name, mimeType: 'application/vnd.google-apps.folder', parents: [parentId] },
+    { name: 'backup', mimeType: 'application/vnd.google-apps.folder', parents: ['root'] },
     null,
     { fields: 'id' }
-  ), `create folder "${folderPath}"`);
+  ), 'create folder "/backup"');
   return created.id;
 }
 
@@ -266,15 +253,16 @@ function findOrCreateFolder(name, parentId, folderPath) {
  *                                   is escaped as '\/', so it can't be
  *                                   confused with the segment separator.
  * @param {string} backupParentId    Drive ID of the destination parent folder.
- * @param {Map}    backedUpInParent  fetchBackedUpMap() result for backupParentId.
+ * @param {Map}    backupMap         Drive-wide fetchBackedUpMap() result.
  * @param {Array}  records           Accumulator for CSV rows.
  * @param {number} startTime         Date.now() at the start of this run.
  */
-function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, backedUpInParent, records, startTime) {
+function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, backupMap, records, startTime) {
   if (isTimedOut(startTime)) return;
 
   // Re-use the backup folder if one was created on a prior run.
-  let backupFolderId = backedUpInParent.get(sourceFolderId)?.id;
+  const existing = backupMap.get(sourceFolderId);
+  let backupFolderId = existing && existing.parentId === backupParentId ? existing.id : undefined;
   if (!backupFolderId) {
     const created = withRetry(() => Drive.Files.create(
       {
@@ -288,9 +276,6 @@ function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, back
     ), `create backup folder "/backup/${folderPath}"`);
     backupFolderId = created.id;
   }
-
-  // Build a map of what's already been backed up inside this folder.
-  const backedUpInFolder = fetchBackedUpMap(backupFolderId, `/backup/${folderPath}`);
 
   // List the source folder's children, excluding media/shortcuts/trash.
   const subfolders = [];
@@ -313,14 +298,14 @@ function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, back
     pageToken = res.nextPageToken;
   } while (pageToken);
 
-  copyFiles(filesToCopy, backupFolderId, backedUpInFolder, records, startTime);
+  copyFiles(filesToCopy, backupFolderId, backupMap, records, startTime);
 
   for (const subfolder of subfolders) {
     if (isTimedOut(startTime)) {
       console.log('Approaching time limit — stopping early. Remaining files will be copied on the next run.');
       break;
     }
-    syncFolder(subfolder.id, subfolder.name, `${folderPath}/${escapePathSegment(subfolder.name)}`, backupFolderId, backedUpInFolder, records, startTime);
+    syncFolder(subfolder.id, subfolder.name, `${folderPath}/${escapePathSegment(subfolder.name)}`, backupFolderId, backupMap, records, startTime);
   }
 }
 
@@ -331,19 +316,19 @@ function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, back
  *
  * @param {Array}  files           File metadata objects from Drive.Files.list.
  * @param {string} backupParentId  Drive ID of the destination folder.
- * @param {Map}    backedUpIds     fetchBackedUpMap() result for backupParentId.
+ * @param {Map}    backupMap       Drive-wide fetchBackedUpMap() result.
  * @param {Array}  records         Accumulator for CSV rows.
  * @param {number} startTime       Date.now() at the start of this run.
  */
-function copyFiles(files, backupParentId, backedUpIds, records, startTime) {
+function copyFiles(files, backupParentId, backupMap, records, startTime) {
   for (const file of files) {
     if (isTimedOut(startTime)) {
       console.log('Approaching time limit — stopping early. Remaining files will be copied on the next run.');
       return;
     }
 
-    const existing = backedUpIds.get(file.id);
-    if (existing && existing.version === String(file.version)) continue;
+    const existing = backupMap.get(file.id);
+    if (existing && existing.version === String(file.version) && existing.parentId === backupParentId) continue;
 
     const filePath = (file.folderPath ? `${file.folderPath}/` : '') + escapePathSegment(file.name);
 
@@ -395,12 +380,6 @@ function csvEscape(value) {
 /**
  * Appends new rows to backup.csv in the root of this account's Drive.
  * Creates the file with a header row if it doesn't exist yet.
- *
- * The 'folder' column is a '/'-joined path whose segments are pre-escaped by
- * escapePathSegment() — a literal '/' within one folder's own name appears as
- * '\/', so splitting the raw cell value on '/' not preceded by '\', then
- * running each piece through unescapePathSegment(), recovers the original
- * per-folder names unambiguously.
  */
 function appendToBackupCsv(records) {
   const columns = ['name', 'folder', 'owner', 'size', 'createdTime', 'modifiedTime', 'copiedTime', 'version'];
