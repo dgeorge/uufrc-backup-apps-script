@@ -55,8 +55,8 @@ function updateBackup() {
     // List every item shared with this account (excluding media, shortcuts, trash).
     const allShared = listSharedItems();
 
-    // Build one backup map across folders, excluding items shared with this account.
-    const backupMap = fetchBackedUpMap();
+    // Index existing backups and folder children across all accessible items.
+    const { backupMap, childrenMap } = fetchBackedUpMap();
 
     // Copy loose files shared directly (not inside a shared folder).
     const sharedFiles = allShared.filter(f => f.mimeType !== 'application/vnd.google-apps.folder');
@@ -69,7 +69,7 @@ function updateBackup() {
         console.log('Approaching time limit — stopping early. Remaining files will be copied on the next run.');
         break;
       }
-      syncFolder(folder.id, folder.name, escapePathSegment(folder.name), backupFolderId, backupMap, records, startTime);
+      syncFolder(folder.id, folder.name, escapePathSegment(folder.name), backupFolderId, backupMap, childrenMap, records, startTime);
     }
 
     if (records.length > 0) {
@@ -173,24 +173,47 @@ function listSharedItems() {
 }
 
 /**
- * Builds a map of { originalFileId → { id: backupFileId, parentId: parent of backupFileId, version: string } }
- * by reading the custom `properties` stamped on backed-up items across all
- * folders, excluding items shared with this account.
+ * When this script ran in the past, we may have copied a file S that has been shared with me, and
+ * the copy is file B that is now stored in the backup/ folder. When we made the copy, we stored two
+ * properties on file B: the id of file S and the current version of file S.
+ * 
+ * When this function executes, it builds a map which contains an entry for each file B that has
+ * been copied in the past. The key for each map entry is originalFileId, which is the id of file
+ * S in this example. The value of each map entry includes the following fields:
+ *  - id: the id of the backup file, which is the id of file B in this example
+ *  - parentId: the parent of the backup file (the id of the folder that contains file B)
+ *  - version: the version of file S at the time when backup file B was created
+ * 
+ * During this script execution, we will traverse all the files that have been shared with me
+ * (including file S, if it is still there). This map will be used to determine whether we already
+ * have a copy of S, and if that copy matches the current version of S. If so, then we don't bother
+ * to copy S again.
+ *
+ * Also builds childrenMap, keyed by folder ID, whose values are arrays of the
+ * listed file records for that folder's children. Returns { backupMap, childrenMap }.
  */
 function fetchBackedUpMap() {
-  const map = new Map();
+  const backupMap = new Map();
+  const childrenMap = new Map();
   let pageToken;
   do {
     const res = withRetry(() => Drive.Files.list({
-      q: "trashed = false",
-      fields: 'nextPageToken, files(id, parents, properties)',
+      q: "mimeType != 'application/vnd.google-apps.shortcut' and not mimeType contains 'image/' and not mimeType contains 'video/' and not mimeType contains 'audio/' and trashed = false",
+      fields: 'nextPageToken, files(id, name, mimeType, version, owners, size, createdTime, modifiedTime, parents, properties)',
       pageSize: 1000,
       pageToken,
-    }), 'list files not shared with me for backup map');
+    }), 'list accessible files for backup and children maps');
     for (const f of (res.files || [])) {
+      if (f.mimeType === 'application/vnd.google-apps.folder' && !childrenMap.has(f.id)) {
+        childrenMap.set(f.id, []);
+      }
+      for (const parentId of (f.parents || [])) {
+        if (!childrenMap.has(parentId)) childrenMap.set(parentId, []);
+        childrenMap.get(parentId).push(f);
+      }
       const props = f.properties;
       if (props && props.uufrc_backup_original_id) {
-        map.set(props.uufrc_backup_original_id, {
+        backupMap.set(props.uufrc_backup_original_id, {
           id: f.id,
           parentId: f.parents && f.parents[0],
           version: props.uufrc_backup_original_version,
@@ -199,7 +222,7 @@ function fetchBackedUpMap() {
     }
     pageToken = res.nextPageToken;
   } while (pageToken);
-  return map;
+  return { backupMap, childrenMap };
 }
 
 /**
@@ -253,11 +276,12 @@ function findOrCreateBackupFolder() {
  *                                   is escaped as '\/', so it can't be
  *                                   confused with the segment separator.
  * @param {string} backupParentId    Drive ID of the destination parent folder.
- * @param {Map}    backupMap         Drive-wide fetchBackedUpMap() result.
+ * @param {Map}    backupMap         Original IDs mapped to existing backups.
+ * @param {Map}    childrenMap       Folder IDs mapped to listed child records.
  * @param {Array}  records           Accumulator for CSV rows.
  * @param {number} startTime         Date.now() at the start of this run.
  */
-function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, backupMap, records, startTime) {
+function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, backupMap, childrenMap, records, startTime) {
   if (isTimedOut(startTime)) return;
 
   // Re-use the backup folder if one was created on a prior run.
@@ -277,26 +301,15 @@ function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, back
     backupFolderId = created.id;
   }
 
-  // List the source folder's children, excluding media/shortcuts/trash.
   const subfolders = [];
   const filesToCopy = [];
-  let pageToken;
-  do {
-    const res = withRetry(() => Drive.Files.list({
-      q: `'${sourceFolderId}' in parents and mimeType != 'application/vnd.google-apps.shortcut' and not mimeType contains 'image/' and not mimeType contains 'video/' and not mimeType contains 'audio/' and trashed = false`,
-      fields: 'nextPageToken, files(id, name, mimeType, version, owners, size, createdTime, modifiedTime)',
-      pageSize: 100,
-      pageToken,
-    }), `list shared folder contents "${folderPath}"`);
-    for (const f of (res.files || [])) {
-      if (f.mimeType === 'application/vnd.google-apps.folder') {
-        subfolders.push(f);
-      } else {
-        filesToCopy.push({ ...f, folderPath });
-      }
+  for (const f of (childrenMap.get(sourceFolderId) || [])) {
+    if (f.mimeType === 'application/vnd.google-apps.folder') {
+      subfolders.push(f);
+    } else {
+      filesToCopy.push({ ...f, folderPath });
     }
-    pageToken = res.nextPageToken;
-  } while (pageToken);
+  }
 
   copyFiles(filesToCopy, backupFolderId, backupMap, records, startTime);
 
@@ -305,7 +318,7 @@ function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, back
       console.log('Approaching time limit — stopping early. Remaining files will be copied on the next run.');
       break;
     }
-    syncFolder(subfolder.id, subfolder.name, `${folderPath}/${escapePathSegment(subfolder.name)}`, backupFolderId, backupMap, records, startTime);
+    syncFolder(subfolder.id, subfolder.name, `${folderPath}/${escapePathSegment(subfolder.name)}`, backupFolderId, backupMap, childrenMap, records, startTime);
   }
 }
 
@@ -316,7 +329,7 @@ function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, back
  *
  * @param {Array}  files           File metadata objects from Drive.Files.list.
  * @param {string} backupParentId  Drive ID of the destination folder.
- * @param {Map}    backupMap       Drive-wide fetchBackedUpMap() result.
+ * @param {Map}    backupMap       Original IDs mapped to existing backups.
  * @param {Array}  records         Accumulator for CSV rows.
  * @param {number} startTime       Date.now() at the start of this run.
  */
