@@ -284,9 +284,22 @@ function findOrCreateBackupFolder() {
 function syncFolder(sourceFolderId, folderName, folderPath, backupParentId, backupMap, childrenMap, records, startTime) {
   if (isTimedOut(startTime)) return;
 
-  // Re-use the backup folder if one was created on a prior run.
+  // Re-use the backup folder, moving it if the source folder changed parents.
   const existing = backupMap.get(sourceFolderId);
-  let backupFolderId = existing && existing.parentId === backupParentId ? existing.id : undefined;
+  let backupFolderId = existing?.id;
+  if (existing && existing.parentId !== backupParentId) {
+    withRetry(() => Drive.Files.update(
+      {},
+      existing.id,
+      null,
+      {
+        addParents: backupParentId,
+        removeParents: existing.parentId,
+        fields: 'id',
+      }
+    ), `move backup folder to "/backup/${folderPath}"`);
+    existing.parentId = backupParentId;
+  }
   if (!backupFolderId) {
     const created = withRetry(() => Drive.Files.create(
       {
